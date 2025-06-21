@@ -64,15 +64,6 @@ python main.py
 ## Notes
 
 - Captcha solving is **not implemented** due to maintenance/time constraints.
+- Example screenshots are available in the `img/readme_screenshot/` directory.
 - Bugs or suggestions? Open an issue or a pull request.
 - For assistance or questions, join the [support server](https://astraadev.github.io/#/discord).
-
----
-
-## 📸 Screenshots
-
-<p align="center">
-  <img src="img/readme_screenshot/readme_1.png" width="400">
-  <img src="img/readme_screenshot/readme_2.png" width="400">
-  <img src="img/readme_screenshot/readme_3.png" width="400">
-</p>
