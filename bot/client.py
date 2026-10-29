@@ -8,6 +8,8 @@ import random
 import logging
 import qrcode
 import io
+from qrcode.image.pil import PilImage
+from PIL import Image
 from discord.ext import commands
 from discord.utils import get
 from typing import Any, Optional
@@ -67,8 +69,8 @@ def generate_qr(data):
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=2)
     qr.add_data(data)
     qr.make(fit=True)
-    img = qr.make_image(fill='black', back_color='white')
-    return img.resize((256, 256))
+    img = qr.make_image(image_factory=PilImage, fill_color='black', back_color='white')
+    return img.get_image().resize((256, 256), Image.NEAREST)
 
 def initialize_guild_data(guild):
     for filename, default_value in [('data/logs_channels.json', None), ('data/roles.json', None),]:
